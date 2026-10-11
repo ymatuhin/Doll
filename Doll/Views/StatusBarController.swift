@@ -10,12 +10,23 @@ class StatusBarController {
     private var isDark = false
     private var latestBadgeText = ""
     private var latestMessageCount = 0
+    private var isHidden = false
+    private var positionDefaultsKey: String?
+    private var positionBackupKey: String?
+    private var savedPosition: Any?
 
     private var giantBadgeController = GiantBadgeViewController()
     private var giantBadgePanel = NSPanel(contentRect: NSRect(origin: .zero, size: defaultWindowSize),
                               styleMask: [.nonactivatingPanel],
                               backing: .buffered, defer: false)
     private var lastTimeShowingGiantBadge = Date()
+
+    // Not an NSPopover: since macOS 27 a popover anchored to a status item takes the system
+    // keyboard focus away from the app the user is typing in, for as long as it is shown.
+    private var notificationPanel = NonKeyPanel(contentRect: .zero,
+                                                styleMask: [.borderless, .nonactivatingPanel],
+                                                backing: .buffered, defer: false)
+    private var hideNotificationPanelWork: DispatchWorkItem?
 
     public var statusItem: NSStatusItem!
     public var monitoredApp: MonitoredApp? {
@@ -100,7 +111,20 @@ class StatusBarController {
         }
 
         let appName = app.appName
-        statusItem.autosaveName = "Doll_\(app.bundleId)"
+        let autosaveName = "Doll_\(app.bundleId)"
+        positionDefaultsKey = "NSStatusItem Preferred Position \(autosaveName)"
+        positionBackupKey = "Doll_SavedPosition_\(app.bundleId)"
+        // Re-seed the OS position from our own backup before macOS reads it (it reads when
+        // the item is given its autosaveName), so a pinned slot survives a Doll restart or
+        // reboot even when the monitored app was closed at the time — macOS discards its own
+        // copy whenever the item is hidden.
+        if let positionBackupKey, let backup = UserDefaults.standard.object(forKey: positionBackupKey) {
+            savedPosition = backup
+            if let positionDefaultsKey, UserDefaults.standard.object(forKey: positionDefaultsKey) == nil {
+                UserDefaults.standard.set(backup, forKey: positionDefaultsKey)
+            }
+        }
+        statusItem.autosaveName = autosaveName
         updateBadgeText(nil)
 
         guard let monitoredAppIcon = monitoredAppIcon else {
@@ -116,6 +140,7 @@ class StatusBarController {
             if appIsNotRunningAndIconShouldBeHidden || badgeIsEmptyAndIconShouldBeHidden {
                 self?.hideStatusBar()
             } else {
+                self?.showStatusBar()
                 let currentIsDark = self?.statusItem.button?.effectiveAppearance.name.rawValue.lowercased().contains("dark") ?? false
                 if(self?.isDark != currentIsDark) {
                     self?.isDark = currentIsDark
@@ -129,26 +154,35 @@ class StatusBarController {
         }
     }
 
-    func showPopover(popover: NSPopover? = nil) {
-        if let statusBarButton = statusItem.button {
-            popover?.show(relativeTo: statusBarButton.bounds, of: statusBarButton, preferredEdge: .maxY)
-            if let contentWindow = popover?.contentViewController?.view.window {
-                // A little hack to prevent popover shitup with menubar
-                // https://stackoverflow.com/a/35047661
-                contentWindow.parent?.removeChildWindow(contentWindow)
+    func hideStatusBar() {
+        guard !isHidden else { return }
+        isHidden = true
+        // Remember the OS-managed menu-bar slot before hiding. Setting isVisible = false
+        // makes macOS discard the saved position (FB9052637), so we snapshot it — in memory
+        // and in our own default, so it also survives a Doll restart / reboot — and write it
+        // back in showStatusBar() / monitorApp() before the item reappears.
+        // https://github.com/feedback-assistant/reports/issues/200
+        if let positionDefaultsKey, let pos = UserDefaults.standard.object(forKey: positionDefaultsKey) {
+            savedPosition = pos
+            if let positionBackupKey {
+                UserDefaults.standard.set(pos, forKey: positionBackupKey)
             }
         }
-    }
-
-    func hidePopover(popover: NSPopover? = nil) {
-        popover?.performClose(nil)
-    }
-
-    func hideStatusBar() {
         statusItem.isVisible = false
     }
 
+    func showStatusBar() {
+        guard isHidden else { return }
+        isHidden = false
+        if let positionDefaultsKey, let savedPosition {
+            UserDefaults.standard.set(savedPosition, forKey: positionDefaultsKey)
+        }
+        statusItem.isVisible = true
+        refreshIcon()
+    }
+
     func updateBadgeText(_ text: String?, force: Bool = false) {
+        guard !isHidden else { return }
         statusItem.isVisible = true
 
         guard !AppSettings.showOnlyAppIcon else {
@@ -160,10 +194,6 @@ class StatusBarController {
         guard force || statusItem.button?.title != text else {
             return
         }
-
-        let textWidth = (text ?? "")
-            .width(withConstrainedHeight: defaultIconSize, font: .systemFont(ofSize: 14))
-        statusItem.length = defaultIconSize + textWidth
 
         // New notification comes in
         let newText = text ?? ""
@@ -185,10 +215,23 @@ class StatusBarController {
         } else {
             let defaultIcon = monitoredAppIcon
             let adjustedIcon = (newText.isEmpty && AppSettings.grayoutIconWhenNothingComing) ? (defaultIcon.grayOut() ?? defaultIcon) : defaultIcon
-            updateBadgeIcon(icon: adjustedIcon)
-            statusItem.length = defaultIconSize + textWidth
             updateBadgeIcon(icon: adjustedIcon, size: CGSize(width: defaultIconSize, height: defaultIconSize))
+
+            // Set title first
             statusItem.button?.title = newText
+
+            // Calculate text width
+            let textWidth = (newText)
+                .width(withConstrainedHeight: defaultIconSize, font: .systemFont(ofSize: 14))
+
+            // Account for NSStatusBarButton's internal spacing between image and title (typically 4-6pt)
+            // macOS 15.2 enforces this spacing more strictly
+            let interElementSpacing: CGFloat = 4
+            statusItem.length = defaultIconSize + interElementSpacing + textWidth
+
+            // Force layout update
+            statusItem.button?.needsLayout = true
+            statusItem.button?.layoutSubtreeIfNeeded()
         }
 
         let newMessageCount = Int(newText) ?? 0
@@ -282,16 +325,25 @@ class StatusBarController {
 
     func tryShowTheNewNotificationPopover(newText: String) {
         if Utils.currentActiveWindowIsFullScreen {
+            showNotificationPanel(newText: newText)
 
-            let notificationPopover = createNotificationPopover(newText: newText)
-            showPopover(popover: notificationPopover)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.hidePopover(popover: notificationPopover)
+            hideNotificationPanelWork?.cancel()
+            let hideWork = DispatchWorkItem { [weak self] in
+                self?.hideNotificationPanel()
             }
+            hideNotificationPanelWork = hideWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: hideWork)
         }
     }
 
+    func hideNotificationPanel() {
+        hideNotificationPanelWork?.cancel()
+        hideNotificationPanelWork = nil
+        notificationPanel.orderOut(nil)
+    }
+
     func destroy() {
+        hideNotificationPanel()
         if let monitoredApp = monitoredApp {
             MonitorService.unObserve(appName: monitoredApp.appName)
             MonitorEngine.shared.unMonitor(app: monitoredApp)
@@ -300,26 +352,60 @@ class StatusBarController {
         }
     }
 
-    private func createNotificationPopover(newText: String) -> NSPopover {
-        let notificationPopover = NSPopover()
+    private func showNotificationPanel(newText: String) {
+        guard let iconWindow = statusItem.button?.window,
+              let screen = iconWindow.screen ?? NSScreen.screenWithMouse else {
+            return
+        }
+
         let textWidth = newText
                 .width(withConstrainedHeight: defaultIconSize, font: .systemFont(ofSize: 14))
         let horizonPadding: CGFloat = 32
         let verticalPadding: CGFloat = 16
-        notificationPopover.contentSize = NSSize(width: defaultIconSize + textWidth + horizonPadding, height: defaultIconSize + verticalPadding)
-        notificationPopover.behavior = .transient
-        notificationPopover.setValue(true, forKeyPath: "shouldHideAnchor")
+        let panelSize = NSSize(width: defaultIconSize + textWidth + horizonPadding, height: defaultIconSize + verticalPadding)
 
         let targetApp = monitoredApp
-        let view = NotificationView(icon: monitoredAppIcon ?? defaultIcon, badgeText: newText) {
+        let view = NotificationView(icon: monitoredAppIcon ?? defaultIcon, badgeText: newText) { [weak self] in
+            self?.hideNotificationPanel()
             if let monitoredAppName = targetApp?.appName {
                 MonitorService.openMonitoredApp(appName: monitoredAppName)
             }
         }
-        notificationPopover.contentViewController = NSHostingController(rootView: view)
 
-        return notificationPopover
+        let background = NSVisualEffectView()
+        background.material = .popover
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 8
+        background.layer?.masksToBounds = true
+        let hostingView = NSHostingView(rootView: view)
+        hostingView.frame = NSRect(origin: .zero, size: panelSize)
+        hostingView.autoresizingMask = [.width, .height]
+        background.addSubview(hostingView)
+
+        notificationPanel.isOpaque = false
+        notificationPanel.backgroundColor = .clear
+        notificationPanel.hasShadow = true
+        notificationPanel.level = .popUpMenu
+        notificationPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        notificationPanel.contentView = background
+
+        // Right below the status item, where the popover used to point from.
+        let iconFrame = iconWindow.frame
+        let gap: CGFloat = 4
+        var origin = NSPoint(x: iconFrame.midX - panelSize.width / 2,
+                             y: min(iconFrame.minY, screen.frame.maxY) - panelSize.height - gap)
+        origin.x = min(max(origin.x, screen.frame.minX + gap), screen.frame.maxX - panelSize.width - gap)
+        notificationPanel.setFrame(NSRect(origin: origin, size: panelSize), display: true)
+        notificationPanel.orderFrontRegardless()
     }
+}
+
+/// A panel that never becomes key or main, so showing it never moves keyboard focus
+/// away from the app the user is currently typing in.
+private class NonKeyPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 extension String {

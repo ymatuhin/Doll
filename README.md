@@ -25,6 +25,41 @@ If we use too much **focus power** without paying the cost, what will we become 
 You can download the latest dmg file from [here](https://github.com/xiaogdgenuine/Doll/releases/latest)
 Minimum system requirement: **_macOS 11.0_** (Big Sur)
 
+## Local build with pending fixes
+
+This fork combines three upstream PRs in `codex/fullscreen-fixes`:
+
+- [#75](https://github.com/xiaogdgenuine/Doll/pull/75) (`c006f4b`, duy84): use a non-activating panel for full-screen alerts to avoid taking keyboard focus on macOS 27.
+- [#71](https://github.com/xiaogdgenuine/Doll/pull/71) (`18c581e`, stavfx): preserve menu-bar icon positions when hiding and showing them.
+- [#70](https://github.com/xiaogdgenuine/Doll/pull/70) (`70c6704`, seemuch): allow spacing between an icon and its notification count.
+
+Build with macOS Command Line Tools and Python 3.9 or later:
+
+```sh
+python3 scripts/build-local.py
+```
+
+The script downloads the exact dependency revisions in `Package.resolved`, builds
+the app and login helper from source, packages images and translations, and signs
+both executables ad hoc. Full Xcode is not required. This build targets macOS 12+
+and the architecture of the build machine. Output: `build/Doll.app` and
+`build/Doll-0.0.9.3-arm64.zip` on Apple Silicon. The original Xcode project remains
+available for normal Xcode builds.
+
+When installed, SDK 26.5 is preferred because Command Line Tools 27 lack the
+SwiftUI macro plugin required by SDK 27. Set `DOLL_SDKROOT` to override this selection.
+
+Quit the installed Doll, then replace it with the new app in Applications. The
+bundle identifier is unchanged, so existing settings are reused. macOS may require
+you to grant Accessibility access again after replacing the signed app. The local
+build is not notarized.
+
+After installation, enable **Show alert in full screen mode**, type in a full-screen
+app, and trigger a new badge in a monitored app. Check that typing continues, the
+alert disappears after three seconds, and clicking it opens the monitored app.
+Also check two-digit counts and icon positions after hiding/showing icons and
+restarting Doll. These interactive checks are separate from a successful build.
+
 # How to use?
 It's simple, click on "+" button at the left bottom corner, search and select the app you want to monitor:
 
